@@ -1,0 +1,150 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitHub Webhooks IPs Security Groups Sync
+
+Parameters:
+  VpcIds:
+    Type: List<AWS::EC2::VPC::Id>
+    Description: The VPCs where the SGs will be created
+  SecurityGroupName:
+    Type: String
+    Default: ALLOW-GITHUB-HOOKS
+    Description: Allow GitHub Webhooks IPs ingress
+  Ports:
+    Type: String
+    AllowedPattern: ^\d+(,\d+)*$
+    Description: Comma separated TPC/IP ports to authorize ingress
+    Default: 80,443
+
+Resources:
+  Scheduler:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: gh-hook-ip-sg-sync
+      Description: Scheduler for GitHub Webhooks IPs Security Groups Sync lambda
+      ScheduleExpression: rate(10 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt Lambda.Arn
+          Id: gh-hook-ip-sg-sync
+
+  SchedulerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref Lambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Scheduler.Arn
+
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: gh-hook-ip-sg-sync
+      Description: GitHub Webhooks IPs Security Groups Sync
+      Architectures:
+        - arm64
+      # The code is generic and will probably be
+      # compatible with future nodejs versions
+      Runtime: nodejs14.x
+      MemorySize: 256
+      Handler: index.handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          VPC_IDS: !Join [ ",", !Ref VpcIds ]
+          SG_NAME: !Ref SecurityGroupName
+          IN_PORT: !Ref Ports
+      Code:
+        ZipFile: |
+          const https = require('https');
+          const EC2 = require('aws-sdk').EC2;
+          const ec2 = new EC2();
+          const name = process.env.SG_NAME;
+          const vpcIds = process.env.VPC_IDS.split(',');
+          const ports = process.env.IN_PORT.split(',').map((e) => parseInt(e));
+          async function listGithubIps() {
+            return new Promise((resolve, reject) => {
+              https.request(
+                { 'method': 'GET', 'hostname': 'api.github.com', 'path': '/meta', 'headers': { 'User-Agent': 'AWS-Lambda' } },
+                function (res) {
+                  var chunks = [];
+                  res.on("data", function (chunk) { chunks.push(chunk); });
+                  res.on("end", function () { resolve(JSON.parse(Buffer.concat(chunks).toString())); });
+                  res.on("error", function (error) { reject(error); });
+                }
+              ).end();
+            });
+          }
+          exports.handler = async function () {
+            const { hooks } = await listGithubIps();
+            const { SecurityGroups } = await ec2.describeSecurityGroups({
+              Filters: [{ Name: "group-name", Values: [name] }],
+            }).promise();
+            for (const vpcId of vpcIds) {
+              const sg = SecurityGroups.find(s => s.VpcId === vpcId);
+              if (!sg) console.log('creating sg');
+              const sgId = sg
+                ? sg.GroupId
+                : (await ec2.createSecurityGroup({ GroupName: name, VpcId: vpcId, Description: name }).promise()).GroupId;
+              const { SecurityGroupRules } = await ec2.describeSecurityGroupRules({ Filters: [{ Name: 'group-id', Values: [sgId] }], }).promise();
+              for (const cidr of hooks) {
+                for(const port of ports) {
+                  if (!SecurityGroupRules.some(r => !r.IsEgress && r.IpProtocol === 'tcp' && r.FromPort === port && (r.CidrIpv4 === cidr || r.CidrIpv6 === cidr))) {
+                    console.log('authorizing ingress', sgId, cidr, port);
+                    const params = { GroupId: sgId, IpPermissions: [{ FromPort: port, ToPort: port, IpProtocol: "tcp" }] };
+                    if (cidr.includes(':')) {
+                      params.IpPermissions[0].Ipv6Ranges = [{ CidrIpv6: cidr }];
+                    } else {
+                      params.IpPermissions[0].IpRanges = [{ CidrIp: cidr }];
+                    }
+                    await ec2.authorizeSecurityGroupIngress(params).promise();
+                  }
+                }
+              }
+              for (const r of SecurityGroupRules) {
+                if (!r.IsEgress && (
+                  r.IpProtocol !== 'tcp'
+                  || r.FromPort !== r.ToPort
+                  || !ports.includes(r.FromPort)
+                  || !hooks.includes(r.CidrIpv4 || r.CidrIpv6)
+                )) {
+                    console.log('revoking ingress', sgId, r.SecurityGroupRuleId);
+                    await ec2.revokeSecurityGroupIngress({ GroupId: sgId, SecurityGroupRuleIds: [r.SecurityGroupRuleId] }).promise();
+                  }
+              }
+            }
+          }
+
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: gh-hook-ip-sg-sync
+      Description: GitHub Webhooks IPs Security Groups Sync lambda iam role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: gh-hook-ip-sg-sync
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:*
+                  - logs:*
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:DescribeTags
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:ModifySecurityGroupRules
+                  - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+                Resource: "*"
