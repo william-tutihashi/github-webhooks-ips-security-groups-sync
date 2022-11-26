@@ -43,9 +43,9 @@ Resources:
       Description: GitHub Webhooks IPs Security Groups Sync
       Architectures:
         - arm64
-      # The code is generic and will probably be
-      # compatible with future nodejs versions
-      Runtime: nodejs14.x
+      # When migrating to nodejs18.x or later it's necessary to migrate to 
+      # aws-sdk v3 as the v2 is not shipped by default anymore
+      Runtime: nodejs16.x
       MemorySize: 256
       Handler: index.handler
       Role: !GetAtt LambdaIAMRole.Arn
